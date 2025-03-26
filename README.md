@@ -28,7 +28,7 @@ Installation
 
 > **NOTE TO PYTHON 3.12 USERS**
 >
-> Since Python 3.12, numpy.distutils has been removed. Fortran compilation capabilities are not included in setuptools, therefore the `.pyf` part of the extension has to be compiled manually beforehand.
+> Since Python 3.12, `numpy.distutils` has been removed. Fortran compilation capabilities are not included in `setuptools`, therefore the `.pyf` part of the extension has to be compiled manually beforehand.
 >
 > To do this, move into the `eqtools/eqtools` folder and run
 > ```
