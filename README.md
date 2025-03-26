@@ -28,13 +28,13 @@ Installation
 
 > **NOTE TO PYTHON 3.12 USERS**
 >
-> Since Python 3.12, numpy.distutils has been removed. Fortran compilation capabilities are not included in setuptools, therefore the .pyf part of the extension has to be compiled manually beforehand.
+> Since Python 3.12, numpy.distutils has been removed. Fortran compilation capabilities are not included in setuptools, therefore the `.pyf` part of the extension has to be compiled manually beforehand.
 >
-> To do this, move into the ```eqtools/eqtools``` folder and run
+> To do this, move into the `eqtools/eqtools` folder and run
 > ```
 > f2py -m _tricub _tricub.pyf
 > ```
-> This will generate the necessary file ```eqtools/_tricubmodule.c```, skipping the Fortran compilation step in setup.py. The latter is up-to-date to compile only .c sources.
+> This will generate the necessary file `eqtools/_tricubmodule.c`, skipping the Fortran compilation step in `setup.py`. The latter is up-to-date to compile only `.c` sources.
 
 The easiest way to install the latest release version is with pip:
     
