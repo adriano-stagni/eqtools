@@ -25,7 +25,7 @@ contains an enhanced bivariate spline which generates bounds errors.
 import scipy 
 import scipy.interpolate
 from . import _tricub
-
+import numpy
 
 class Spline():
     """Tricubic interpolating spline with forced edge derivative equal zero
@@ -69,7 +69,7 @@ class Spline():
             output = map.ev(x1, y1, z1)
     
     """
-    def __init__(self, x, y, z, f, boundary = 'natural', dx=0, dy=0, dz=0, bounds_error=True, fill_value=scipy.nan):
+    def __init__(self, x, y, z, f, boundary = 'natural', dx=0, dy=0, dz=0, bounds_error=True, fill_value=numpy.nan):
         if dx != 0 or dy != 0 or dz != 0:
             raise NotImplementedError(
                 "Trispline derivatives are not implemented, do not use tricubic "
@@ -239,7 +239,7 @@ class RectBivariateSpline(scipy.interpolate.RectBivariateSpline):
             Default is ``s=0``, which is for interpolation.
     """
 
-    def __init__(self, x, y, z, bbox=[None] *4, kx=3, ky=3, s=0, bounds_error=True, fill_value=scipy.nan):
+    def __init__(self, x, y, z, bbox=[None] *4, kx=3, ky=3, s=0, bounds_error=True, fill_value=numpy.nan):
 
         super(RectBivariateSpline, self).__init__( x, y, z, bbox=bbox, kx=kx, ky=ky, s=s)
         self._xlim = scipy.array((x.min(), x.max()))
@@ -341,5 +341,5 @@ class UnivariateInterpolator(scipy.interpolate.InterpolatedUnivariateSpline):
             out[out < self.min_val] = self.min_val
         if self.max_val is not None:
             out[out > self.max_val] = self.max_val
-        out[(x < self.get_knots().min()) | (x > self.get_knots().max())] = scipy.nan
+        out[(x < self.get_knots().min()) | (x > self.get_knots().max())] = numpy.nan
         return out

@@ -7617,7 +7617,7 @@ class Equilibrium(object):
         return [uR * R / uT, uZ * R / uT]
     
     def rz2FieldLineTrace(self, R0, Z0, t, phi0=0.0, field='B', num_rev=1.0,
-                          rev_method='toroidal', dphi=2.0 * scipy.pi / 100.0,
+                          rev_method='toroidal', dphi=2.0 * scipy.constants.pi / 100.0,
                           integrator='dopri5'):
         """Trace a field line starting from a given (R, phi, Z) point.
         
