@@ -20,10 +20,12 @@
 working with ASDEX Upgrade experimental data.
 """
 
-import scipy
-from .core import PropertyAccessMixin, ModuleWarning, Equilibrium
+from scipy.interpolate import interp1d
+import numpy
+from .core import PropertyAccessMixin, ModuleWarning, Equilibrium, inPolygon
 import warnings
 import numpy as np
+from collections import namedtuple
 
 try:
     import MDSplus
@@ -53,10 +55,6 @@ try:
     import matplotlib.pyplot as plt
 
     _has_plt = True
-    try:
-        import matplotlib._cntr as cntr
-    except:
-        import legacycontour._cntr as cntr
 
 except:
     warnings.warn(
@@ -65,6 +63,19 @@ except:
         ModuleWarning,
     )
     _has_plt = False
+    
+# Removed old import call to matplotlib._cntr and legacycontour._cntr
+# since they refere to older versions of matplotlib and python and they are deprecated now.
+try:
+    from skimage.measure import find_contours as cntr
+    _has_cntr = True
+except:
+    warnings.warn(
+        "skimage.measure module could not be loaded -- classes that "
+        "use skimage.measure will not work.",
+        ModuleWarning,
+    )
+    _has_cntr = False
 
 
 class AUGMDSTree(Equilibrium):
@@ -135,20 +146,25 @@ class AUGMDSTree(Equilibrium):
         tspline=False,
         monotonic=True,
         experiment="AUGD",
-        server="localhost:8000",
+        server="ssh://localhost",
+        connection=None,
     ):
 
         super(AUGMDSTree, self).__init__(
             length_unit=length_unit, tspline=tspline, monotonic=monotonic
         )
 
-        self.server = server
+        if isinstance(connection, MDSplus.connection.Connection):
+            self._MDSTree = connection
+            self.server = self._MDSTree.hostspec
+        else:
+            self.server = server
+            self._MDSTree = MDSplus.Connection(self.server)
         self._shot = shot
         self._tree = tree
         self._edition = 0
         self._experiment = experiment
         print(self._shot, self._tree, edition, experiment)
-        self._MDSTree = MDSplus.Connection(self.server)
         try:
             if shotfile2 is None:
                 self._treessq = self._relatedSVFile[self._tree]
@@ -290,8 +306,8 @@ class AUGMDSTree(Equilibrium):
             + '",{}'.format(self._edition)
             + ")"
         )
-        return self._MDSTree.getObject(_s, timeout=3000000)
-
+        return self._MDSTree.get(_s, timeout=3000000)
+    
     def _mdsaugvessel(self, shot, shotfile, signal):
         """ wrapper for the augdiag TDI function data time"""
         _s = (
@@ -304,7 +320,7 @@ class AUGMDSTree(Equilibrium):
             + self._experiment
             + '")'
         )
-        return self._MDSTree.getObject(_s, timeout=1000000)
+        return self._MDSTree.get(_s, timeout=1000000)
 
     def __str__(self):
         """string formatting for ASDEX Upgrade Equilibrium class.
@@ -372,7 +388,7 @@ class AUGMDSTree(Equilibrium):
         """
         if self._time is None:
             try:
-                timeNode = self._mdsaugdiag(self._tree, "time")
+                timeNode = self._MDSTree.get(f"dim_of(augdiag({self._shot},'{self._tree}','PFxx','{self._experiment}',{self._edition}) ,0)")
                 self._time = timeNode.data()
                 self._defaultUnits["_time"] = str("s")
             except:
@@ -395,11 +411,9 @@ class AUGMDSTree(Equilibrium):
                 psinode = self._mdsaugdiag(self._tree, "PFM")
                 self._psiRZ = np.moveaxis(psinode.data(), -1, 0)
                 self._defaultUnits["_psiRZ"] = "Vs"  # HARDCODED DUE TO CALIBRATED=FALSE
-                self._rGrid = psinode.getDimensionAt(1).data()[
-                    :, 0
-                ]  # assumes data from first is correct (WHY IS IT EVEN DUPICATED???)
+                self._rGrid = self._mdsaugdiag(self._tree, "Ri").data()[:,0]
                 self._defaultUnits["_rGrid"] = str("m")
-                self._zGrid = psinode.getDimensionAt(2).data()[:, 0]
+                self._zGrid = self._mdsaugdiag(self._tree, "Zj").data()[:,0]
                 self._defaultUnits["_zGrid"] = str("m")
 
             except:
@@ -584,7 +598,7 @@ class AUGMDSTree(Equilibrium):
                     rgeo.data(), (templen[1] + 1, 1)
                 ).T + RLCFStemp * np.cos(
                     np.tile(
-                        (np.linspace(0, 2 * scipy.pi, templen[1] + 1)), (templen[0], 1),
+                        (np.linspace(0, 2 * numpy.pi, templen[1] + 1)), (templen[0], 1),
                     )
                 )  # construct a 2d grid of angles, take cos, multiply by radius
                 self._defaultUnits["_RLCFS"] = str("m")
@@ -614,7 +628,7 @@ class AUGMDSTree(Equilibrium):
                 ZLCFSNode = self._mdsaugdiag(self._treessq, "rays")
                 ZLCFStemp = np.hstack(
                     (
-                        scipy.atleast_2d(ZLCFSNode.data().transpose()[:, -1]).T,
+                        numpy.atleast_2d(ZLCFSNode.data().transpose()[:, -1]).T,
                         ZLCFSNode.data().transpose(),
                     )
                 )
@@ -666,37 +680,38 @@ class AUGMDSTree(Equilibrium):
                 "Limiter outline (self.getMachineCrossSection) must be available."
             )
 
-        plt.ioff()
+        # plt.ioff() # Obsolete, given the change from matplotlib._cntr to skimage.measure.find_contours
 
         psiRZ = self.getFluxGrid()  # [nt,nZ,nR]
         R = self.getRGrid()
         Z = self.getZGrid()
         psiLCFS = self.getFluxLCFS()
         # build a mesh grid
-        RR, ZZ = scipy.meshgrid(R, Z)
+        RR, ZZ = numpy.meshgrid(R, Z)
 
         RLCFS_stores = []
         ZLCFS_stores = []
         maxlen = 0
-        nt = len(self.getTimeBase())
+        nt = len(psiRZ)
         #        fig = plt.figure()
         for i in range(nt):
-            cs = cntr.Cntr(RR, ZZ, psiRZ[i])
-            nlist = cs.trace(psiLCFS[i])
-            segs = nlist[: len(nlist) // 2]
+            cs = cntr(psiRZ[i].T, level=psiLCFS[i])
+            for ic in range(len(cs)):
+                cs[ic][:,0] = interp1d(np.arange(0, R.size), R)(cs[ic][:,0])
+                cs[ic][:,1] = interp1d(np.arange(0, Z.size), Z)(cs[ic][:,1])
             RLCFS_frame = []
             ZLCFS_frame = []
-            for v in segs:
+            for v in cs:
                 RLCFS_frame.extend(v[:, 0])
                 ZLCFS_frame.extend(v[:, 1])
-                RLCFS_frame.append(scipy.nan)
-                ZLCFS_frame.append(scipy.nan)
-            RLCFS_frame = scipy.array(RLCFS_frame)
-            ZLCFS_frame = scipy.array(ZLCFS_frame)
+                RLCFS_frame.append(numpy.nan)
+                ZLCFS_frame.append(numpy.nan)
+            RLCFS_frame = numpy.array(RLCFS_frame)
+            ZLCFS_frame = numpy.array(ZLCFS_frame)
 
             # generate masking array to vessel
             if mask:
-                maskarr = scipy.array([False for i in range(len(RLCFS_frame))])
+                maskarr = numpy.array([False for i in range(len(RLCFS_frame))])
                 for i, x in enumerate(RLCFS_frame):
                     y = ZLCFS_frame[i]
                     maskarr[i] = inPolygon(Rlim, Zlim, x, y)
@@ -709,8 +724,8 @@ class AUGMDSTree(Equilibrium):
             RLCFS_stores.append(RLCFS_frame)
             ZLCFS_stores.append(ZLCFS_frame)
 
-        RLCFS = scipy.zeros((nt, maxlen))
-        ZLCFS = scipy.zeros((nt, maxlen))
+        RLCFS = numpy.zeros((nt, maxlen))
+        ZLCFS = numpy.zeros((nt, maxlen))
         for i in range(nt):
             RLCFS_frame = RLCFS_stores[i]
             ZLCFS_frame = ZLCFS_stores[i]
@@ -1522,7 +1537,7 @@ class AUGMDSTree(Equilibrium):
             currentSign (Integer): 1 for positive-direction current, -1 for negative.
         """
         if self._currentSign is None:
-            self._currentSign = -1 if scipy.mean(self.getIpMeas()) > 1e5 else 1
+            self._currentSign = -1 if numpy.mean(self.getIpMeas()) > 1e5 else 1
         return self._currentSign
 
     def getParam(self, path):
@@ -2942,7 +2957,7 @@ class AUGMDSTree(Equilibrium):
             ),
         }
         # ONLY CERTAIN YGC FILES EXIST I MEAN CMON ITS NOT THAT MUCH MEMORY
-        self._ygc_shotfiles = scipy.array(
+        self._ygc_shotfiles = numpy.array(
             [
                 0,
                 948,
@@ -2964,7 +2979,7 @@ class AUGMDSTree(Equilibrium):
         try:
 
             self._ygc_shot = self._ygc_shotfiles[
-                scipy.searchsorted(self._ygc_shotfiles, [shot], "right") - 1
+                numpy.searchsorted(self._ygc_shotfiles, [shot], "right") - 1
             ][
                 0
             ]  # find nearest shotfile which is the before it
@@ -3050,8 +3065,8 @@ class AUGMDSTree(Equilibrium):
                 x.append(None)
                 y.append(None)
 
-        x = scipy.array(x[:-1])
-        y = scipy.array(y[:-1])
+        x = numpy.array(x[:-1])
+        y = numpy.array(y[:-1])
         return (x, y)
 
 
