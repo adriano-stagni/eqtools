@@ -415,13 +415,12 @@ class AUGMDSTree(Equilibrium):
         if self._psiRZ is None:
             try:
                 psinode = self._mdsaugdiag(self._tree, "PFM")
-                self._psiRZ = np.moveaxis(psinode.data(), -1, 0)
+                self._psiRZ = np.moveaxis(psinode.data(), -1, 0) / (2 * np.pi) # Correct for a factor 2*pi (verified with Bp values)
                 self._defaultUnits["_psiRZ"] = "Vs"  # HARDCODED DUE TO CALIBRATED=FALSE
                 self._rGrid = self._mdsaugdiag(self._tree, "Ri").data()[:,0]
                 self._defaultUnits["_rGrid"] = str("m")
                 self._zGrid = self._mdsaugdiag(self._tree, "Zj").data()[:,0]
                 self._defaultUnits["_zGrid"] = str("m")
-
             except:
                 raise ValueError("data retrieval failed.")
         return self._psiRZ.copy()
