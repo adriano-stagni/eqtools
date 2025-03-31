@@ -21,6 +21,8 @@ working with ASDEX Upgrade experimental data.
 """
 
 import scipy
+import scipy.constants
+import numpy
 
 from .core import PropertyAccessMixin, ModuleWarning, Equilibrium
 
@@ -538,7 +540,7 @@ class AUGDDData(Equilibrium):
                     rgeo.data, (templen[1] + 1, 1)
                 ).T + RLCFStemp * scipy.cos(
                     scipy.tile(
-                        (scipy.linspace(0, 2 * scipy.pi, templen[1] + 1)),
+                        (scipy.linspace(0, 2 * scipy.constants.pi, templen[1] + 1)),
                         (templen[0], 1),
                     )
                 )  # construct a 2d grid of angles, take cos, multiply by radius
@@ -576,7 +578,7 @@ class AUGDDData(Equilibrium):
                     zgeo.data, (templen[1] + 1, 1)
                 ).T + ZLCFStemp * scipy.sin(
                     scipy.tile(
-                        (scipy.linspace(0, 2 * scipy.pi, templen[1] + 1)),
+                        (scipy.linspace(0, 2 * scipy.constants.pi, templen[1] + 1)),
                         (templen[0], 1),
                     )
                 )  # construct a 2d grid of angles, take sin, multiply by radius
@@ -642,12 +644,12 @@ class AUGDDData(Equilibrium):
                 ZLCFS_frame.extend(v[:, 1])
                 RLCFS_frame.append(scipy.nan)
                 ZLCFS_frame.append(scipy.nan)
-            RLCFS_frame = scipy.array(RLCFS_frame)
-            ZLCFS_frame = scipy.array(ZLCFS_frame)
+            RLCFS_frame = numpy.array(RLCFS_frame)
+            ZLCFS_frame = numpy.array(ZLCFS_frame)
 
             # generate masking array to vessel
             if mask:
-                maskarr = scipy.array([False for i in range(len(RLCFS_frame))])
+                maskarr = numpy.array([False for i in range(len(RLCFS_frame))])
                 for i, x in enumerate(RLCFS_frame):
                     y = ZLCFS_frame[i]
                     maskarr[i] = inPolygon(Rlim, Zlim, x, y)
@@ -2792,7 +2794,7 @@ class YGCAUGInterface(object):
     }
 
     # ONLY CERTAIN YGC FILES EXIST I MEAN CMON ITS NOT THAT MUCH MEMORY
-    _ygc_shotfiles = scipy.array(
+    _ygc_shotfiles = numpy.array(
         [
             0,
             948,
@@ -2902,8 +2904,8 @@ class YGCAUGInterface(object):
                 x.append(None)
                 y.append(None)
 
-        x = scipy.array(x[:-1])
-        y = scipy.array(y[:-1])
+        x = numpy.array(x[:-1])
+        y = numpy.array(y[:-1])
         return (x, y)
 
 
