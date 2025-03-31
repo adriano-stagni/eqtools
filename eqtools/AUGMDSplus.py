@@ -291,10 +291,10 @@ class AUGMDSTree(Equilibrium):
         self.getFluxLabel() # check
         self.getFluxVol()  # check
         self.getVolLCFS()  # check
-        # self.getQProfile()  #
-        # self._ygcauginterface()  # needed to initialize Vessel properties
-        # self.getBtVac()
-        # self.remapLCFS()
+        self.getQProfile()  #
+        self._ygcauginterface()  # needed to initialize Vessel properties
+        self.getBtVac()
+        self.remapLCFS()
 
     #
     def _mdsaugdiag(self, shotfile, signal):
