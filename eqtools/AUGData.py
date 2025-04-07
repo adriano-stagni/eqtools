@@ -20,13 +20,38 @@
 working with ASDEX Upgrade experimental data.
 """
 
-import scipy
-import scipy.constants
 import numpy
+from scipy.interpolate import interp1d
+from scipy.constants import mu_0
 
-from .core import PropertyAccessMixin, ModuleWarning, Equilibrium
+from .core import PropertyAccessMixin, ModuleWarning, Equilibrium, inPolygon
+from joblib import Parallel, delayed
+from tqdm import tqdm
 
 import warnings
+
+from collections import namedtuple
+
+try:
+    import aug_sfutils as sf
+
+    _has_sf = True
+
+except Exception as _e_sf:
+    if isinstance(_e_sf, ImportError):
+        warnings.warn(
+            "aug_sfutils module could not be loaded -- classes that use "
+            "aug_sfutils for data access will not work.",
+            ModuleWarning,
+        )
+    else:
+        warnings.warn(
+            "aug_sfutils module could not be loaded -- classes that use "
+            "aug_sfutils for data access will not work. Exception raised "
+            "was of type %s, message was '%s'." % (_e_sf.__class__, _e_sf.message),
+            ModuleWarning,
+        )
+    _has_sf = False
 
 try:
     import dd
@@ -52,6 +77,7 @@ except Exception as _e_dd:
 
 try:
     import matplotlib.pyplot as plt
+    from contourpy import contour_generator as cntr
 
     _has_plt = True
 except:
@@ -62,8 +88,7 @@ except:
     )
     _has_plt = False
 
-
-class AUGDDData(Equilibrium):
+class AUGSFData(Equilibrium):
     """Inherits :py:class:`eqtools.Equilibrium` class. Machine-specific data
     handling class for ASDEX Upgrade. Pulls AFS data from selected location
     and shotfile, stores as object attributes. Each data variable or set of
@@ -133,19 +158,22 @@ class AUGDDData(Equilibrium):
         experiment="AUGD",
     ):
 
-        if not _has_dd:
-            print("dd module did not load properly")
+        if not _has_sf:
+            print("aug_sfutils module did not load properly")
             print("Most functionality will not be available!")
 
-        super(AUGDDData, self).__init__(
+        super(AUGSFData, self).__init__(
             length_unit=length_unit, tspline=tspline, monotonic=monotonic
         )
 
         self._shot = shot
         self._tree = shotfile
         print(self._shot, self._tree, edition, experiment)
-        self._MDSTree = dd.shotfile(
-            self._tree, self._shot, edition=edition, experiment=experiment
+        self._shotFile = sf.SFREAD(
+            self._shot, self._tree, ed=edition, exp=experiment
+        )
+        self._equ = sf.EQU(
+            self._shot, diag=self._tree, eq=edition, exp=experiment
         )
 
         try:
@@ -153,8 +181,8 @@ class AUGDDData(Equilibrium):
                 shotfile2 = self._relatedSVFile[self._tree]
 
             # Overwrite getSSQ with a shotfile with same capabilities
-            self.getSSQ = dd.shotfile(
-                shotfile2, self._shot, edition=edition, experiment=experiment
+            self.getSSQ = sf.SFREAD(
+                self._shot, shotfile2, ed=edition, exp=experiment
             )
         except (KeyError, PyddError):
             warnings.warn(
@@ -238,10 +266,14 @@ class AUGDDData(Equilibrium):
         self._zGrid = None  # Z-axis (t)
         self._psiLCFS = None  # flux at LCFS (t)
         self._psiAxis = None  # flux at magnetic axis (t)
+        self._psiLabel = None # poloidal flux label (t,psi)
+        self._psiNLabel = None # normalized poloidal flux label (t,psi)
         self._fluxVol = None  # volume within flux surface (t,psi)
         self._volLCFS = None  # volume within LCFS (t)
         self._qpsi = None  # q profile (psi,t)
         self._RmidPsi = None  # max major radius of flux surface (t,psi)
+        self._xlow = None # lower x-point coordinates (t,2)
+        self._xup = None # upper x-point coordinates (t,2)
 
         # AUG SV file flag
         self._SSQ = None
@@ -253,10 +285,14 @@ class AUGDDData(Equilibrium):
         self.getFluxGrid()  # loads _psiRZ, _rGrid and _zGrid at once. check
         self.getFluxLCFS()  # check
         self.getFluxAxis()  # check
+        self.getFluxLabel() # check
+        self.getNormFluxLabel() # check
         self.getFluxVol()  # check
-        self._lpf = self.getFluxVol().shape[1]
         self.getVolLCFS()  # check
         self.getQProfile()  #
+        self._ygcauginterface()  # needed to initialize Vessel properties
+        self.getBtVac()
+        self.remapLCFS()
 
     def __str__(self):
         """string formatting for ASDEX Upgrade Equilibrium class.
@@ -287,7 +323,7 @@ class AUGDDData(Equilibrium):
             return mes
         except TypeError:
             return "tree has failed data load."
-
+        
     def getInfo(self):
         """returns namedtuple of shot information
         
@@ -312,7 +348,7 @@ class AUGDDData(Equilibrium):
 
         data = namedtuple("Info", ["shot", "tree", "nr", "nz", "nt"])
         return data(shot=self._shot, tree=self._tree, nr=nr, nz=nz, nt=nt)
-
+    
     def getTimeBase(self):
         """returns time base vector.
 
@@ -324,13 +360,12 @@ class AUGDDData(Equilibrium):
         """
         if self._time is None:
             try:
-                timeNode = self._MDSTree("time")
-                self._time = timeNode.data
-                self._defaultUnits["_time"] = str(timeNode.unit)
-            except PyddError:
+                self._time = self._shotFile.getobject("time").copy()
+                self._defaultUnits["_time"] = self._time.phys_unit
+            except:
                 raise ValueError("data retrieval failed.")
         return self._time.copy()
-
+    
     def getFluxGrid(self):
         """returns flux grid.
         
@@ -344,26 +379,16 @@ class AUGDDData(Equilibrium):
         """
         if self._psiRZ is None:
             try:
-                psinode = self._MDSTree("Ri")
-                self._rGrid = psinode.data[
-                    0
-                ]  # assumes data from first is correct (WHY IS IT EVEN DUPICATED???)
-                self._defaultUnits["_rGrid"] = str(psinode.unit)
-                psinode = self._MDSTree("Zj")
-                self._zGrid = psinode.data[0]
-                self._defaultUnits["_zGrid"] = str(psinode.unit)
-                psinode = self._MDSTree(
-                    "PFM", calibrated=False
-                )  # calibrated signal causes seg faults (SERIOUSLY WHAT THE FUCK ASDEX)
-                self._psiRZ = psinode.data[
-                    : self._timeidxend, : len(self._zGrid), : len(self._rGrid)
-                ]
-                self._defaultUnits["_psiRZ"] = psi.units  # HARDCODED DUE TO CALIBRATED=FALSE
-
-            except PyddError:
+                self._psiRZ = self._equ.pfm.transpose((2,1,0)) / (2* numpy.pi) # Correct for a factor 2*pi (verified with Bp values)
+                self._defaultUnits["_psiRZ"] = self._psiRZ.phys_unit  # HARDCODED DUE TO CALIBRATED=FALSE
+                self._rGrid = self._equ.Rmesh.copy()
+                self._defaultUnits["_rGrid"] = self._rGrid.phys_unit
+                self._zGrid = self._equ.Zmesh.copy()
+                self._defaultUnits["_zGrid"] = self._zGrid.phys_unit
+            except:
                 raise ValueError("data retrieval failed.")
         return self._psiRZ.copy()
-
+    
     def getRGrid(self, length_unit=1):
         """returns R-axis.
 
@@ -381,7 +406,7 @@ class AUGDDData(Equilibrium):
             self._defaultUnits["_rGrid"], length_unit
         )
         return unit_factor * self._rGrid.copy()
-
+    
     def getZGrid(self, length_unit=1):
         """returns Z-axis.
 
@@ -399,7 +424,7 @@ class AUGDDData(Equilibrium):
             self._defaultUnits["_zGrid"], length_unit
         )
         return unit_factor * self._zGrid.copy()
-
+    
     def getFluxAxis(self):
         """returns psi on magnetic axis.
 
@@ -411,13 +436,12 @@ class AUGDDData(Equilibrium):
         """
         if self._psiAxis is None:
             try:
-                psiAxisNode = self._MDSTree("PFxx")
-                self._psiAxis = psiAxisNode.data[: self._timeidxend, 0]
-                self._defaultUnits["_psiAxis"] = str(psiAxisNode.unit)
-            except PyddError:
+                self._psiAxis = self._equ.psi0.copy() / (2 * numpy.pi)
+                self._defaultUnits["_psiAxis"] = self._equ.psi0.phys_unit
+            except:
                 raise ValueError("data retrieval failed.")
         return self._psiAxis.copy()
-
+    
     def getFluxLCFS(self):
         """returns psi at separatrix.
 
@@ -429,12 +453,45 @@ class AUGDDData(Equilibrium):
         """
         if self._psiLCFS is None:
             try:
-                psiLCFSNode = self._MDSTree("PFL")
-                self._psiLCFS = psiLCFSNode.data[: self._timeidxend, 0]
-                self._defaultUnits["_psiLCFS"] = str(psiLCFSNode.unit)
+                self._psiLCFS = self._equ.psi_lcfs.copy() / (2 * numpy.pi)
+                self._defaultUnits["_psiLCFS"] = self._equ.psi_lcfs.phys_unit
             except PyddError:
                 raise ValueError("data retrieval failed.")
         return self._psiLCFS.copy()
+    
+    def getFluxLabel(self):
+        """returns time-dependent poloidal flux label array.
+        
+        Returns:
+            psiLabel (Array) [nt,npfl]: time-dependent array of poloidal flux labels
+        
+        Raises:
+            ValueError: if module cannot retrieve data from the AUG shotfile system.
+        """
+        if self._psiLabel is None:
+            try:
+                self._psiLabel = self._equ.pfl.copy() / (2 * numpy.pi)
+                self._defaultUnits["_psiLabel"] = self._equ.pfl.phys_unit
+            except:
+                raise ValueError("data retrieval failed.")
+        return self._psiLabel.copy()
+    
+    def getNormFluxLabel(self):
+        """returns time-dependent normalized poloidal flux label array.
+        
+        Returns:
+            psiNLabel (Array) [nt,npfl]: time-dependent array of normalized poloidal flux labels
+        
+        Raises:
+            ValueError: if module cannot retrieve data from the AUG shotfile system.
+        """
+        if self._psiNLabel is None:
+            try:
+                self._psiNLabel = self._equ.psiN.copy()
+                self._defaultUnits["_psiNLabel"] = '' # The version stored in aug_sfutils.EQU uses 'Vs' as units, which is obviously wrong for a normalized quantity
+            except:
+                raise ValueError("data retrieval failed.")
+        return self._psiNLabel.copy()
 
     def getFluxVol(self, length_unit=3):
         """returns volume within flux surface.
@@ -451,30 +508,14 @@ class AUGDDData(Equilibrium):
         """
         if self._fluxVol is None:
             try:
-                fluxVolNode = self._MDSTree(
-                    "Vol"
-                )  # Lpf is unreliable so I have to do this trick....
-                temp = (
-                    scipy.where(scipy.sum(fluxVolNode.data, axis=0)[::2] != 0)[0].max()
-                    + 1
-                )  # Find the where the volume is non-zero, give the maximum index and add one (for the core value)
-
-                self._fluxVol = fluxVolNode.data[: self._timeidxend][
-                    :, : 2 * temp + 1 : 2
-                ][
-                    :, ::-1
-                ]  # reverse it so that it is a monotonically increasing function
-                if fluxVolNode.unit != " ":
-                    self._defaultUnits["_fluxVol"] = str(fluxVolNode.unit)
-                else:
-                    self._defaultUnits["_fluxVol"] = "m^3"
-            except PyddError:
+                self._fluxVol = self._equ.vol.copy()
+                self._defaultUnits["_fluxVol"] = self._equ.vol.phys_unit
+            except:
                 raise ValueError("data retrieval failed.")
-        # Default units are m^3, but aren't stored in the tree!
         unit_factor = self._getLengthConversionFactor(
             self._defaultUnits["_fluxVol"], length_unit
         )
-        return unit_factor * self._fluxVol.copy()
+        return self._fluxVol.copy()
 
     def getVolLCFS(self, length_unit=3):
         """returns volume within LCFS.
@@ -491,17 +532,16 @@ class AUGDDData(Equilibrium):
         """
         if self._volLCFS is None:
             try:
-                volLCFSNode = self._MDSTree("Vol")
-                self._volLCFS = volLCFSNode.data[: self._timeidxend, 0]
-                self._defaultUnits["_volLCFS"] = str(volLCFSNode.unit)
-            except PyddError:
+                self._volLCFS = self._equ.Vol.copy()
+                self._defaultUnits["_volLCFS"] = 'm^3' # Units not stored in the SFOBJ onstance
+            except:
                 raise ValueError("data retrieval failed.")
         # Default units should be 'cm^3':
         unit_factor = self._getLengthConversionFactor(
             self._defaultUnits["_volLCFS"], length_unit
         )
         return unit_factor * self._volLCFS.copy()
-
+    
     def getRmidPsi(self, length_unit=1):
         """returns maximum major radius of each flux surface.
 
@@ -516,7 +556,57 @@ class AUGDDData(Equilibrium):
         Raises:
             NotImplementedError: Not implemented on ASDEX-Upgrade reconstructions.
         """
-        raise NotImplementedError("self.getRmidPsi not implemented.")
+        if self._RmidPsi is None:
+            try:
+                psiLevels = numpy.asarray(self.getFluxLabel())
+                psiRZ = numpy.asarray(self.getFluxGrid())  # [nt,nZ,nR]
+                R = numpy.asarray(self.getRGrid())
+                Z = numpy.asarray(self.getZGrid())
+                Rmag, Zmag = numpy.asarray(self.getMagR()), numpy.asarray(self.getMagZ())
+                RZxpo, RZxpu = numpy.asarray(self.getUpperXpoint()), numpy.asarray(self.getLowerXpoint())
+
+                def process_timestep(args):
+                    it, R, Z, psiRZ_it, psiLevels_it, Rmag_it, Zmag_it, RZxpo_it, RZxpu_it = args
+                    from contourpy import contour_generator as cntr # Import contourpy inside the function to ensure it's available in each process
+                    levels = psiLevels_it # Get levels for this timestep
+                    results = numpy.full(len(levels), numpy.nan)
+                    cg = cntr(x=R, y=Z, z=psiRZ_it, name='serial') # Create contour generator for this timestep
+                    cs = numpy.array(
+                        [min(
+                            cg.lines(level),
+                            key=lambda c: numpy.hypot(c[:,0] - Rmag_it, c[:,1] - Zmag_it).min(),
+                            default=numpy.array([[numpy.nan, numpy.nan]]))
+                         for level in levels], dtype='object')
+                    if numpy.sign(RZxpo_it[1]/RZxpu_it[1]) == -1:
+                        mask = (cs[-1][:,1] > RZxpu_it[1]) & (cs[-1][:,1] < RZxpo_it[1])
+                        cs[-1] = cs[-1][mask,:]
+                        if not numpy.allclose(cs[-1][0,:], cs[-1][-1,:]):
+                            cs[-1] = numpy.vstack((cs[-1], cs[-1][0,:]))
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore')
+                        results = numpy.vectorize(lambda c: numpy.nanmax(c[:,0]))(cs)
+                    return it, results
+                
+                nt = psiLevels.shape[1]
+                n_workers = 16
+                _RmidPsi = numpy.tile(numpy.nan, psiLevels.shape)
+                results = Parallel(n_jobs=n_workers)(
+                    delayed(process_timestep)(
+                        (it, R, Z, psiRZ[it], psiLevels[it,:], Rmag[it], Zmag[it], RZxpo[it,:], RZxpu[it,:])
+                    ) for it in tqdm(range(psiLevels.shape[0]), desc="Processing equilibrium times (RmidPsi)", ascii='-##')
+                )
+
+                for it, r_values in results:
+                    _RmidPsi[it,:] = r_values
+
+                self._RmidPsi = _RmidPsi.copy()
+                self._defaultUnits["_RmidPsi"] = "m"
+            except:
+                raise ValueError("data retrieval failed.")
+        unit_factor = self._getLengthConversionFactor(
+            self._defaultUnits["_RmidPsi"], length_unit
+        )
+        return unit_factor * self._RmidPsi.copy()
 
     def getRLCFS(self, length_unit=1):
         """returns R-values of LCFS position.
@@ -529,27 +619,28 @@ class AUGDDData(Equilibrium):
         """
         if self._RLCFS is None:
             try:
-                rgeo = self.getSSQ("Rgeo")
-                RLCFSNode = self.getSSQ("rays")
-                RLCFStemp = scipy.hstack(
-                    (scipy.atleast_2d(RLCFSNode.data[:, -1]).T, RLCFSNode.data)
+                rgeo = self._equ.Rgeo.copy()
+                ray_names = [r for r in self._equ.ssqnames if r.startswith("ray__")]
+                rays = numpy.array([getattr(self._equ, r) for r in ray_names]).T
+                RLCFStemp = numpy.hstack(
+                    (numpy.atleast_2d(rays[:,-1]).T, rays)
                 )
-                templen = RLCFSNode.data.shape
+                templen = rays.shape
 
-                self._RLCFS = scipy.tile(
+                self._RLCFS = numpy.tile(
                     rgeo.data, (templen[1] + 1, 1)
-                ).T + RLCFStemp * scipy.cos(
-                    scipy.tile(
-                        (scipy.linspace(0, 2 * scipy.constants.pi, templen[1] + 1)),
+                ).T + RLCFStemp * numpy.cos(
+                    numpy.tile(
+                        (numpy.linspace(0, 2 * numpy.pi, templen[1] + 1)),
                         (templen[0], 1),
                     )
                 )  # construct a 2d grid of angles, take cos, multiply by radius
-                self._defaultUnits["_RLCFS"] = str(RLCFSNode.unit)
+                self._defaultUnits["_RLCFS"] = 'm'
             except KeyError:
                 self.remapLCFS()
                 self._defaultUnits["_RLCFS"] = str("m")
                 self._defaultUnits["_ZLCFS"] = str("m")
-            except PyddError:
+            except:
                 raise ValueError("data retrieval failed.")
         unit_factor = self._getLengthConversionFactor(
             self._defaultUnits["_RLCFS"], length_unit
@@ -568,21 +659,22 @@ class AUGDDData(Equilibrium):
         if self._ZLCFS is None:
             try:
                 zgeo = self.getSSQ("Zgeo")
-                ZLCFSNode = self.getSSQ("rays")
-                ZLCFStemp = scipy.hstack(
-                    (scipy.atleast_2d(ZLCFSNode.data[:, -1]).T, ZLCFSNode.data)
+                ray_names = [r for r in self._equ.ssqnames if r.startswith("ray__")]
+                rays = numpy.array([getattr(self._equ, r) for r in ray_names]).T
+                ZLCFStemp = numpy.hstack(
+                    (numpy.atleast_2d(rays[:,-1]).T, rays)
                 )
-                templen = ZLCFSNode.data.shape
+                templen = rays.shape
 
-                self._ZLCFS = scipy.tile(
+                self._ZLCFS = numpy.tile(
                     zgeo.data, (templen[1] + 1, 1)
-                ).T + ZLCFStemp * scipy.sin(
-                    scipy.tile(
-                        (scipy.linspace(0, 2 * scipy.constants.pi, templen[1] + 1)),
+                ).T + ZLCFStemp * numpy.sin(
+                    numpy.tile(
+                        (numpy.linspace(0, 2 * numpy.pi, templen[1] + 1)),
                         (templen[0], 1),
                     )
                 )  # construct a 2d grid of angles, take sin, multiply by radius
-                self._defaultUnits["_ZLCFS"] = str(ZLCFSNode.unit)
+                self._defaultUnits["_ZLCFS"] = 'm'
             except KeyError:
                 self.remapLCFS()
                 self._defaultUnits["_RLCFS"] = str("m")
@@ -621,7 +713,7 @@ class AUGDDData(Equilibrium):
                 "Limiter outline (self.getMachineCrossSection) must be available."
             )
 
-        plt.ioff()
+        # plt.ioff() # Obsolete, given the change from matplotlib._cntr to skimage.measure.find_contours
 
         psiRZ = self.getFluxGrid()  # [nt,nZ,nR]
         R = self.getRGrid()
@@ -631,19 +723,17 @@ class AUGDDData(Equilibrium):
         RLCFS_stores = []
         ZLCFS_stores = []
         maxlen = 0
-        nt = len(self.getTimeBase())
-        fig = plt.figure()
+        nt = len(psiRZ)
+        #        fig = plt.figure()
         for i in range(nt):
-            cs = plt.contour(R, Z, psiRZ[i], [psiLCFS[i]])
-            paths = cs.collections[0].get_paths()
+            cs = cntr(x=R, y=Z, z=psiRZ[i], name='serial').lines(psiLCFS[i])
             RLCFS_frame = []
             ZLCFS_frame = []
-            for path in paths:
-                v = path.vertices
+            for v in cs:
                 RLCFS_frame.extend(v[:, 0])
                 ZLCFS_frame.extend(v[:, 1])
-                RLCFS_frame.append(scipy.nan)
-                ZLCFS_frame.append(scipy.nan)
+                RLCFS_frame.append(numpy.nan)
+                ZLCFS_frame.append(numpy.nan)
             RLCFS_frame = numpy.array(RLCFS_frame)
             ZLCFS_frame = numpy.array(ZLCFS_frame)
 
@@ -662,8 +752,8 @@ class AUGDDData(Equilibrium):
             RLCFS_stores.append(RLCFS_frame)
             ZLCFS_stores.append(ZLCFS_frame)
 
-        RLCFS = scipy.zeros((nt, maxlen))
-        ZLCFS = scipy.zeros((nt, maxlen))
+        RLCFS = numpy.zeros((nt, maxlen))
+        ZLCFS = numpy.zeros((nt, maxlen))
         for i in range(nt):
             RLCFS_frame = RLCFS_stores[i]
             ZLCFS_frame = ZLCFS_stores[i]
@@ -681,12 +771,6 @@ class AUGDDData(Equilibrium):
         self._defaultUnits["_RLCFS"] = rUnit
         self._defaultUnits["_ZLCFS"] = zUnit
 
-        # cleanup
-        plt.ion()
-        plt.clf()
-        plt.close(fig)
-        plt.ioff()
-
     def getF(self):
         """returns F=RB_{\Phi}(\Psi), often calculated for grad-shafranov 
         solutions.
@@ -699,14 +783,9 @@ class AUGDDData(Equilibrium):
         """
         if self._fpol is None:
             try:
-                fNode = self._MDSTree(
-                    "Jpol"
-                )  # From definition of F with poloidal current
-                self._fpol = (
-                    fNode.data[: self._timeidxend, : 2 * self._lpf : 2][::-1] * 2e-7
-                )
-                self._defaultUnits["_fpol"] = str("T m")
-            except PyddError:
+                self._fpol = self._equ.jpol.copy() * 2e-7
+                self._defaultUnits["_fpol"] = str("Tm")
+            except:
                 raise ValueError("data retrieval failed.")
         return self._fpol.copy()
 
@@ -721,14 +800,9 @@ class AUGDDData(Equilibrium):
         """
         if self._fluxPres is None:
             try:
-                fluxPresNode = self._MDSTree("Pres")
-                self._fluxPres = fluxPresNode.data[: self._timeidxend][
-                    :, : 2 * self._lpf : 2
-                ][
-                    :, ::-1
-                ]  # reverse it so that it is a monotonically increasing function
-                self._defaultUnits["_fluxPres"] = str(fluxPresNode.unit)
-            except PyddError:
+                self._fluxPres = self._equ.pres.copy()
+                self._defaultUnits["_fluxPres"] = self._equ.pres.phys_unit
+            except:
                 raise ValueError("data retrieval failed.")
         return self._fluxPres.copy()
 
@@ -742,19 +816,13 @@ class AUGDDData(Equilibrium):
         Raises:
             ValueError: if module cannot retrieve data from the AUG AFS system.
         """
-        if self._fpol is None:
+        if self._fprime is None:
             try:
-                fNode = self._MDSTree(
-                    "Jpol"
-                )  # From definition of F with poloidal current
-                self._fpol = (
-                    fNode.data[: self._timeidxend, 1 : 2 * self._lpf + 1 : 2][::-1]
-                    * 2e-7
-                )
-                self._defaultUnits["_fpol"] = str("T m")
-            except PyddError:
+                self._fprime = self._equ.djpol.copy() * 2e-7
+                self._defaultUnits["_fpol"] = str("Tm")
+            except:
                 raise ValueError("data retrieval failed.")
-        return self._fpol.copy()
+        return self._fprime.copy()
 
     def getFFPrime(self):
         """returns FF' function used for grad-shafranov solutions.
@@ -767,10 +835,9 @@ class AUGDDData(Equilibrium):
         """
         if self._ffprim is None:
             try:
-                FFPrimeNode = self._MDSTree("FFP")
-                self._ffprim = FFPrimeNode.data[: self._timeidxend, : self._lpf][::-1]
-                self._defaultUnits["_ffprim"] = str(FFPrimeNode.unit)
-            except PyddError:
+                self._ffprim = self._equ.ffp.copy()
+                self._defaultUnits["_ffprim"] = self._equ.ffp.phys_unit
+            except:
                 raise ValueError("data retrieval failed.")
         return self._ffprim.copy()
 
@@ -786,14 +853,9 @@ class AUGDDData(Equilibrium):
         """
         if self._pprime is None:
             try:
-                pPrimeNode = self._MDSTree("Pres")
-                self._pprime = pPrimeNode.data[: self._timeidxend][
-                    :, 1 : 2 * self._lpf + 1 : 2
-                ][
-                    :, ::-1
-                ]  # reverse it so that it is a monotonically increasing function
-                self._defaultUnits["_pprime"] = str(pPrimeNode.unit)
-            except PyddError:
+                self._pprime = self._equ.dpres.copy()
+                self._defaultUnits["_pprime"] = self._equ.dpres.phys_unit
+            except:
                 raise ValueError("data retrieval failed.")
         return self._pprime.copy()
 
@@ -808,10 +870,9 @@ class AUGDDData(Equilibrium):
         """
         if self._kappa is None:
             try:
-                kappaNode = self.getSSQ("k")
-                self._kappa = kappaNode.data
-                self._defaultUnits["_kappa"] = str(kappaNode.unit)
-            except PyddError:
+                self._kappa = self._equ.k.copy()
+                self._defaultUnits["_kappa"] = self._equ.k.phys_unit
+            except:
                 raise ValueError("data retrieval failed.")
         return self._kappa.copy()
 
@@ -826,10 +887,9 @@ class AUGDDData(Equilibrium):
         """
         if self._dupper is None:
             try:
-                dupperNode = self.getSSQ("delRoben")
-                self._dupper = dupperNode.data
-                self._defaultUnits["_dupper"] = str(dupperNode.unit)
-            except PyddError:
+                self._dupper = self._equ.delRoben.copy()
+                self._defaultUnits["_dupper"] = self._equ.delRoben.phys_unit
+            except:
                 raise ValueError("data retrieval failed.")
         return self._dupper.copy()
 
@@ -844,10 +904,9 @@ class AUGDDData(Equilibrium):
         """
         if self._dlower is None:
             try:
-                dlowerNode = self.getSSQ("delRuntn")
-                self._dlower = dlowerNode.data
-                self._defaultUnits["_dlower"] = str(dlowerNode.unit)
-            except PyddError:
+                self._dlower = self._equ.delRuntn.copy()
+                self._defaultUnits["_dlower"] = self._equ.delRuntn.phys_unit
+            except:
                 raise ValueError("data retrieval failed.")
         return self._dlower.copy()
 
@@ -880,10 +939,9 @@ class AUGDDData(Equilibrium):
         """
         if self._rmag is None:
             try:
-                rmagNode = self.getSSQ("Rmag")
-                self._rmag = rmagNode.data
-                self._defaultUnits["_rmag"] = str(rmagNode.unit)
-            except (PyddError, AttributeError):
+                self._rmag = self._equ.Rmag.copy()
+                self._defaultUnits["_rmag"] = str("m")
+            except AttributeError:
                 raise ValueError("data retrieval failed.")
         unit_factor = self._getLengthConversionFactor(
             self._defaultUnits["_rmag"], length_unit
@@ -901,10 +959,9 @@ class AUGDDData(Equilibrium):
         """
         if self._zmag is None:
             try:
-                zmagNode = self.getSSQ("Zmag")
-                self._zmag = zmagNode.data
-                self._defaultUnits["_zmag"] = str(zmagNode.unit)
-            except PyddError:
+                self._zmag = self._equ.Zmag.copy()
+                self._defaultUnits["_zmag"] = str("m")
+            except:
                 raise ValueError("data retrieval failed.")
         unit_factor = self._getLengthConversionFactor(
             self._defaultUnits["_zmag"], length_unit
@@ -926,10 +983,9 @@ class AUGDDData(Equilibrium):
         """
         if self._areaLCFS is None:
             try:
-                areaLCFSNode = self._MDSTree("Area")
-                self._areaLCFS = areaLCFSNode.data[: self._timeidxend, 0]
-                self._defaultUnits["_areaLCFS"] = str(areaLCFSNode.unit)
-            except PyddError:
+                self._areaLCFS = self._equ.area.copy()
+                self._defaultUnits["_areaLCFS"] = self._equ.area.phys_unit
+            except:
                 raise ValueError("data retrieval failed.")
         # Units should be cm^2:
         unit_factor = self._getLengthConversionFactor(
@@ -952,10 +1008,9 @@ class AUGDDData(Equilibrium):
         """
         if self._aLCFS is None:
             try:
-                aLCFSNode = self.getSSQ("ahor")
-                self._aLCFS = aLCFSNode.data
-                self._defaultUnits["_aLCFS"] = str(aLCFSNode.unit)
-            except PyddError:
+                self._aLCFS = self._equ.ahor.copy()
+                self._defaultUnits["_aLCFS"] = "m" # not in sf.EQU, must hard code this
+            except:
                 raise ValueError("data retrieval failed.")
         unit_factor = self._getLengthConversionFactor(
             self._defaultUnits["_aLCFS"], length_unit
@@ -972,7 +1027,16 @@ class AUGDDData(Equilibrium):
         Raises:
             NotImplementedError: Not implemented on ASDEX-Upgrade reconstructions.
         """
-        raise NotImplementedError("self.getRmidOut not implemented.")
+        if self._RmidLCFS is None:
+            try:
+                self._RmidLCFS = self._equ.Raus.copy()
+                self._defaultUnits["_RmidLCFS"] = "m" # not in sf.EQU, must hard code this
+            except:
+                raise ValueError("data retrieval failed.")
+        unit_factor = self._getLengthConversionFactor(
+            self._defaultUnits["_aLCFS"], length_unit
+        )
+        return unit_factor * self._aLCFS.copy()
 
     def getGeometry(self, length_unit=None):
         """pulls dimensional geometry parameters.
@@ -1019,10 +1083,9 @@ class AUGDDData(Equilibrium):
         """
         if self._qpsi is None:
             try:
-                qpsiNode = self._MDSTree("Qpsi")
-                self._qpsi = qpsiNode.data[: self._timeidxend, : self._lpf]
-                self._defaultUnits["_qpsi"] = str(qpsiNode.unit)
-            except PyddError:
+                self._qpsi = self._equ.q.copy()
+                self._defaultUnits["_qpsi"] = self._equ.q.phys_unit
+            except:
                 raise ValueError("data retrieval failed.")
         return self._qpsi.copy()
 
@@ -1037,10 +1100,9 @@ class AUGDDData(Equilibrium):
         """
         if self._q0 is None:
             try:
-                q0Node = self.getSSQ("q0")
-                self._q0 = q0Node.data
-                self._defaultUnits["_q0"] = str(q0Node.unit)
-            except (PyddError, AttributeError):
+                self._q0 = self._equ.q0.copy()
+                self._defaultUnits["_q0"] = self._equ.q0.phys_unit
+            except AttributeError:
                 raise ValueError("data retrieval failed.")
         return self._q0.copy()
 
@@ -1055,10 +1117,9 @@ class AUGDDData(Equilibrium):
         """
         if self._q95 is None:
             try:
-                q95Node = self.getSSQ("q95")
-                self._q95 = q95Node.data
-                self._defaultUnits["_q95"] = str(q95Node.unit)
-            except (PyddError, AttributeError):
+                self._q95 = self._equ.q95.copy()
+                self._defaultUnits["_q95"] = self._equ.q95.phys_unit
+            except AttributeError:
                 raise ValueError("data retrieval failed.")
         return self._q95.copy()
 
@@ -1113,13 +1174,10 @@ class AUGDDData(Equilibrium):
         """
         if self._btaxv is None:
             try:
-                btaxvNode = self._MDSTree("Bave")
-                # technically Bave is the average over the volume, but for the core its a singular value
-                self._btaxv = btaxvNode.data[
-                    : self._timeidxend, scipy.sum(btaxvNode.data, 0) != 0
-                ][:, -1]
-                self._defaultUnits["_btaxv"] = str(btaxvNode.unit)
-            except (PyddError, AttributeError):
+                _btaxv = sf.SFREAD(self._shot, "MBI")
+                self._btaxv = interp1d(_btaxv.gettimebase("BTF"), _btaxv.getobject("BTF").data())(self._time)
+                self._defaultUnits["_btaxv"] = 'T'
+            except AttributeError:
                 raise ValueError("data retrieval failed.")
         return self._btaxv.copy()
 
@@ -1129,7 +1187,13 @@ class AUGDDData(Equilibrium):
         Raises:
             NotImplementedError: Not implemented on ASDEX-Upgrade reconstructions.
         """
-        raise NotImplementedError("self.getBtPla not implemented.")
+        if self._btaxp is None:
+            try:
+                self._btaxp = self._equ.bave[:,0].copy()
+                self._defaultUnits["_btaxv"] = 'T' # Not in sf.EQU, must hard code this
+            except AttributeError:
+                raise ValueError("data retrieval failed.")
+        return self._btaxp.copy()
 
     def getBpAvg(self):
         """returns average poloidal field.
@@ -1148,7 +1212,7 @@ class AUGDDData(Equilibrium):
         raise NotImplementedError("self.getFields not implemented.")
 
     def getIpCalc(self):
-        """returns Plasma Current, is the same as getIpMeas.
+        """returns Plasma Current from FPcurr parametrization (ask M. Dunne, I have no idea...)
 
         Returns:
             IpCalc (Array): [nt] array of the reconstructed plasma current.
@@ -1158,10 +1222,10 @@ class AUGDDData(Equilibrium):
         """
         if self._IpCalc is None:
             try:
-                IpCalcNode = self._MDSTree("IpiPSI")
-                self._IpCalc = scipy.squeeze(IpCalcNode.data)[: self._timeidxend]
-                self._defaultUnits["_IpCalc"] = str(IpCalcNode.unit)
-            except (PyddError, AttributeError):
+                _IpCalc = sf.SFREAD(self._shot, "FPC")
+                self._IpCalc = interp1d(_IpCalc.gettimebase("IpiFP"), _IpCalc.getobject("IpiFP"))(self._time)
+                self._defaultUnits["_IpCalc"] = 'A'
+            except AttributeError:
                 raise ValueError("data retrieval failed.")
         return self._IpCalc.copy()
 
@@ -1174,7 +1238,14 @@ class AUGDDData(Equilibrium):
         Raises:
             ValueError: if module cannot retrieve data from the AUG AFS system.
         """
-        return self.getIpCalc()
+        if self._IpMeas is None:
+            try:
+                _IpMeas = sf.SFREAD(self._shot, "MAG")
+                self._IpMeas = interp1d(_IpMeas.gettimebase("Ipa"), _IpMeas.getobject("Ipa"))(self._time)
+                self._defaultUnits["_IpMeas"] = 'A'
+            except AttributeError:
+                raise ValueError("data retrieval failed.")
+        return self._IpMeas.copy()
 
     def getJp(self):
         """returns the calculated plasma current density Jp on flux grid.
@@ -1185,22 +1256,25 @@ class AUGDDData(Equilibrium):
         Raises:
             ValueError: if module cannot retrieve data from the AUG AFS system.
         """
-        if self._Jp is None:
-            try:
-                JpNode = self._MDSTree("CDM", calibrated=False)
-                self._Jp = JpNode.data
-                self._defaultUnits["_Jp"] = str(JpNode.unit)
-            except (PyddError, AttributeError):
-                raise ValueError("data retrieval failed.")
-        return self._Jp.copy()
+        raise NotImplementedError("self.getJp not implemented for AUG reconstructions.")
 
     def getBetaT(self):
         """returns the calculated toroidal beta.
+        It is not saved in any shotfile (that I know...)
+        so I calculate it from Wmhd, volume and Btor
 
         Raises:
             NotImplementedError: Not implemented on ASDEX-Upgrade reconstructions.
         """
-        raise NotImplementedError("self.getBetaT not implemented.")
+        if self._betat is None:
+            try:
+                _WMHD, _Vol = self.getWMHD(), self.getVolLCFS()
+                _pAvg = _WMHD/_Vol
+                _bt0 = self.getBtPla()
+                self._betat = 2*mu_0 * _pAvg / _bt0**2
+            except:
+                raise ValueError("data retrieval failed.")
+        return self._betat.copy()
 
     def getBetaP(self):
         """returns the calculated poloidal beta.
@@ -1213,10 +1287,9 @@ class AUGDDData(Equilibrium):
         """
         if self._betap is None:
             try:
-                betapNode = self.getSSQ("betpol")
-                self._betap = betapNode.data
-                self._defaultUnits["_betap"] = str(betapNode.unit)
-            except (PyddError, AttributeError):
+                self._betap = self._equ.betpol.copy()
+                self._defaultUnits["_betap"] = self._equ.betpol.phys_unit
+            except AttributeError:
                 raise ValueError("data retrieval failed.")
         return self._betap.copy()
 
@@ -1231,10 +1304,9 @@ class AUGDDData(Equilibrium):
         """
         if self._Li is None:
             try:
-                LiNode = self.getSSQ("li")
-                self._Li = LiNode.data
-                self._defaultUnits["_Li"] = str(LiNode.unit)
-            except (PyddError, AttributeError):
+                self._Li = self._equ.li.copy()
+                self._defaultUnits["_Li"] = self._equ.li.phys_unit
+            except AttributeError:
                 raise ValueError("data retrieval failed.")
         return self._Li.copy()
 
@@ -1244,7 +1316,14 @@ class AUGDDData(Equilibrium):
         Raises:
             NotImplementedError: Not implemented on ASDEX-Upgrade reconstructions.
         """
-        raise NotImplementedError("self.getBetas not implemented.")
+        try:
+            betat = self.getBetaT()
+            betap = self.getBetaP()
+            Li = self.getLi()
+            data = namedtuple("Betas", ["betat", "betap", "Li"])
+            return data(betat=betat, betap=betap, Li=Li)
+        except ValueError:
+            raise ValueError("data retrieval failed.")        
 
     def getDiamagFlux(self):
         """returns the measured diamagnetic-loop flux.
@@ -1306,10 +1385,9 @@ class AUGDDData(Equilibrium):
         """
         if self._WMHD is None:
             try:
-                WMHDNode = self.getSSQ("Wmhd")
-                self._WMHD = WMHDNode.data
-                self._defaultUnits["_WMHD"] = str(WMHDNode.unit)
-            except (PyddError, AttributeError):
+                self._WMHD = self._equ.Wmhd.copy()
+                self._defaultUnits["_WMHD"] = self._equ.Wmhd.phys_unit
+            except AttributeError:
                 raise ValueError("data retrieval failed.")
         return self._WMHD.copy()
 
@@ -1358,20 +1436,24 @@ class AUGDDData(Equilibrium):
         if self._BCentr is None:
             try:
                 try:
-                    temp = dd.shotfile("MBI", self._shot)
-                    BCentrNode = temp("BTFABB")
-                    self._BCentr = BCentrNode.data[
-                        self._getNearestIdx(self.getTimeBase(), BCentrNode.time)
+                    temp = sf.SFREAD(self._shot, "MBI")# self._mdsaugdiag("MBI", "BTFABB")
+                    BCentr = temp.getobject("BTFABB")
+                    self._BCentr = BCentr[
+                        self._getNearestIdx(
+                            self.getTimeBase(), temp.gettimebase("BTFABB")
+                        )
                     ]
-                    self._defaultUnits["_BCentr"] = str(BCentrNode.unit)
-                except PyddError:
-                    temp = dd.shotfile("MBI", self._shot)
-                    BCentrNode = temp("BTF")
-                    self._BCentr = BCentrNode.data[
-                        self._getNearestIdx(self.getTimeBase(), BCentrNode.time)
+                    self._defaultUnits["_BCentr"] = BCentr.phys_unit
+                except:
+                    temp = sf.SFREAD(self._shot, "MBI")
+                    BCentr = temp.getobject("BTF")
+                    self._BCentr = BCentr[
+                        self._getNearestIdx(
+                            self.getTimeBase(), temp.gettimebase("BTF")
+                        )
                     ]
-                    self._defaultUnits["_BCentr"] = str(BCentrNode.unit)
-            except (PyddError, AttributeError):
+                    self._defaultUnits["_BCentr"] = BCentr.phys_unit
+            except AttributeError:
                 raise ValueError("data retrieval failed.")
 
         return self._BCentr
@@ -1385,11 +1467,186 @@ class AUGDDData(Equilibrium):
         if self._RCentr is None:
             self._RCentr = 1.65  # Hardcoded from MAI file description of BTF
             self._defaultUnits["_RCentr"] = "m"
-        return self._RCentr
+        unit_factor = self._getLengthConversionFactor(
+            self._defaultUnits["_RCentr"], length_unit
+        )
+        return self._RCentr * unit_factor
+
+    def getLowerXpoint(self):
+        """Returns (R, Z) values of the lower x-points as a function of time
+
+        Returns:
+            R, Z: of the lower X-point as a function of time
+        """
+        if self._xlow is None:
+            try:
+                self._xlow = numpy.zeros((self._time.size, 2))
+                self._xlow[0, :] = self._equ.Rxpu.copy()
+                self._xlow[1, :] = self._equ.Zxpu.copy()
+                self._defaultUnits["_xlow"] = "m"
+            except AttributeError:
+                raise ValueError("data retrieval failed.")
+        return self._xlow.copy()
+
+    def getUpperXpoint(self):
+        """Returns (R, Z) values of the upper x-points as a function of time
+
+        Returns:
+            R, Z: of the upper X-point as a function of time
+        """
+        if self._xup is None:
+            try:
+                self._xup = numpy.zeros((self._time.size, 2))
+                self._xup[0, :] = self._equ.Rxpo.copy()
+                self._xup[1, :] = self._equ.Zxpo.copy()
+                self._defaultUnits["_xup"] = "m"
+            except AttributeError:
+                raise ValueError("data retrieval failed.")
+        return self._xup.copy()
 
     def getEnergy(self):
-        """pulls the calculated energy parameters - stored energy, tau_E, 
-        injected power, d/dt of magnetic and plasma stored energy.
+        """pulls the calculated energy parameters - stored energy, tau_E,
+            injected power, d/dt of magnetic and plasma stored energy.
+
+            Raises:
+                NotImplementedError: Not implemented on ASDEX-Upgrade reconstructions.
+            """
+        raise NotImplementedError("self.getEnergy not implemented.")
+
+    def getMachineCrossSection(self):
+        """Returns R,Z coordinates of vacuum-vessel wall for masking, plotting 
+        routines.
+        
+        Returns:
+            (`R_limiter`, `Z_limiter`)
+
+            * **R_limiter** (`Array`) - [n] array of x-values for machine cross-section.
+            * **Z_limiter** (`Array`) - [n] array of y-values for machine cross-section.
+        """
+        if self._Rlimiter is None or self._Zlimiter is None:
+            try:
+                self._Rlimiter, self._Zlimiter = self._VesselgetMachineCrossSection()
+
+            except AttributeError:
+                raise ValueError("data retrieval failed.")
+        return (self._Rlimiter, self._Zlimiter)
+
+    def getMachineCrossSectionFull(self):
+        """Returns R,Z coordinates of vacuum-vessel wall for plotting routines.
+        
+        Absent additional vector-graphic data on machine cross-section, returns
+        :py:meth:`getMachineCrossSection`.
+        
+        Returns:
+            result from getMachineCrossSection().
+        """
+        x, y = self._VesselgetMachineCrossSectionFull()
+        x[x > self.getRGrid().max()] = self.getRGrid().max()
+
+        return (x, y)
+
+    def getCurrentSign(self):
+        """Returns the sign of the current, based on the check in Steve Wolfe's 
+        IDL implementation efit_rz2psi.pro.
+
+        Returns:
+            currentSign (Integer): 1 for positive-direction current, -1 for negative.
+        """
+        if self._currentSign is None:
+            self._currentSign = numpy.nanmedian(numpy.sign(self.getIpMeas()))
+        return self._currentSign
+    
+    def remapLCFS(self, mask=False):
+        """Overwrites RLCFS, ZLCFS values pulled with explicitly-calculated 
+        contour of psinorm=1 surface.  This is then masked down by the limiter
+        array using core.inPolygon, restricting the contour to the closed
+        plasma surface and the divertor legs.
+
+        Keyword Args:
+            mask (Boolean): Default False.  Set True to mask LCFS path to 
+                limiter outline (using inPolygon).  Set False to draw full 
+                contour of psi = psiLCFS.
+
+        Raises:
+            NotImplementedError: if :py:mod:`matplotlib.pyplot` is not loaded.
+            ValueError: if limiter outline is not available.
+        """
+        if not _has_plt:
+            raise NotImplementedError(
+                "Requires matplotlib.pyplot for contour calculation."
+            )
+
+        try:
+            Rlim, Zlim = self.getMachineCrossSection()
+        except:
+            raise ValueError(
+                "Limiter outline (self.getMachineCrossSection) must be available."
+            )
+
+        psiRZ = numpy.asarray(self.getFluxGrid())  # [nt,nZ,nR]
+        R = numpy.asarray(self.getRGrid())
+        Z = numpy.asarray(self.getZGrid())
+        psiLCFS = numpy.asarray(self.getFluxLCFS())
+
+        RLCFS_stores = []
+        ZLCFS_stores = []
+        maxlen = 0
+        nt = len(self.getTimeBase())
+        for i in range(nt):
+            cs = cntr(x=R, y=Z, z=psiRZ[i], name='serial').lines(psiLCFS[i])
+            RLCFS_frame = []
+            ZLCFS_frame = []
+            for v in cs:
+                RLCFS_frame.extend(v[:, 0])
+                ZLCFS_frame.extend(v[:, 1])
+                RLCFS_frame.append(numpy.nan)
+                ZLCFS_frame.append(numpy.nan)
+            RLCFS_frame = numpy.array(RLCFS_frame)
+            ZLCFS_frame = numpy.array(ZLCFS_frame)
+
+            # generate masking array to vessel
+            if mask:
+                maskarr = numpy.array([False for i in range(len(RLCFS_frame))])
+                for i, x in enumerate(RLCFS_frame):
+                    y = ZLCFS_frame[i]
+                    maskarr[i] = inPolygon(Rlim, Zlim, x, y)
+
+                RLCFS_frame = RLCFS_frame[maskarr]
+                ZLCFS_frame = ZLCFS_frame[maskarr]
+
+            if len(RLCFS_frame) > maxlen:
+                maxlen = len(RLCFS_frame)
+            RLCFS_stores.append(RLCFS_frame)
+            ZLCFS_stores.append(ZLCFS_frame)
+
+        RLCFS = numpy.zeros((nt, maxlen))
+        ZLCFS = numpy.zeros((nt, maxlen))
+        for i in range(nt):
+            RLCFS_frame = RLCFS_stores[i]
+            ZLCFS_frame = ZLCFS_stores[i]
+            ni = len(RLCFS_frame)
+            RLCFS[i, 0:ni] = RLCFS_frame
+            ZLCFS[i, 0:ni] = ZLCFS_frame
+
+        # store final values
+        self._RLCFS = RLCFS
+        self._ZLCFS = ZLCFS
+
+        # set default unit parameters, based on RZ grid
+        rUnit = self._defaultUnits["_rGrid"]
+        zUnit = self._defaultUnits["_zGrid"]
+        self._defaultUnits["_RLCFS"] = rUnit
+        self._defaultUnits["_ZLCFS"] = zUnit
+    
+    def getParam(self, path):
+        """Backup function, applying a direct path input for tree-like data 
+        storage access for parameters not typically found in 
+        :py:class:`Equilbrium <eqtools.core.Equilbrium>` object.  
+        Directly calls attributes read from g/a-files in copy-safe manner.
+
+        Args:
+            name (String): Parameter name for value stored in EqdskReader 
+                instance.
 
         Raises:
             NotImplementedError: Not implemented on ASDEX-Upgrade reconstructions.
@@ -1408,11 +1665,9 @@ class AUGDDData(Equilibrium):
         """
         if self._Rlimiter is None or self._Zlimiter is None:
             try:
-                self._Rlimiter, self._Zlimiter = AUGVessel.getMachineCrossSection(
-                    self._shot
-                )
+                self._Rlimiter, self._Zlimiter = self._VesselgetMachineCrossSection()
 
-            except (PyddError, AttributeError):
+            except AttributeError:
                 raise ValueError("data retrieval failed.")
         return (self._Rlimiter, self._Zlimiter)
 
@@ -1425,1422 +1680,1391 @@ class AUGDDData(Equilibrium):
         Returns:
             result from getMachineCrossSection().
         """
-        x, y = AUGVessel.getMachineCrossSectionFull(self._shot)
+        x, y = self._VesselgetMachineCrossSectionFull()
         x[x > self.getRGrid().max()] = self.getRGrid().max()
 
         return (x, y)
 
-    def getCurrentSign(self):
-        """Returns the sign of the current, based on the check in Steve Wolfe's 
-        IDL implementation efit_rz2psi.pro.
+    def _ygcauginterface(self):
+        self._vessel_components = {
+            0: (
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            948: (
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            8650: (
+                1,
+                1,
+                0,
+                0,
+                1,
+                0,
+                1,
+                0,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+            ),
+            9401: (
+                1,
+                1,
+                0,
+                0,
+                1,
+                0,
+                1,
+                0,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+            ),
+            12751: (
+                1,
+                1,
+                0,
+                0,
+                1,
+                0,
+                1,
+                0,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                1,
+            ),
+            14051: (
+                1,
+                1,
+                0,
+                0,
+                1,
+                0,
+                1,
+                0,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+            ),
+            14601: (
+                1,
+                1,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+            ),
+            16315: (
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+            ),
+            18204: (
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+            ),
+            19551: (
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                1,
+                1,
+                1,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+            ),
+            21485: (
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+            ),
+            25891: (
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+            ),
+            30136: (
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+            ),
+        }
+        # counter-clockwise from the inner wall order of components
+        self._order = {
+            0: (9, 8, 7, 5, 2, 1, 14, 13, 12, 0, 4, 6),
+            948: (9, 8, 7, 5, 2, 1, 10, 0, 4, 6),
+            8650: (9, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 1, 10, 0, 4, 6),
+            9401: (9, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 10, 0, 4, 6),
+            12751: (9, 29, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 10, 0, 4, 6),
+            14051: (
+                9,
+                29,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                28,
+                10,
+                0,
+                4,
+                6,
+            ),
+            14601: (
+                9,
+                29,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                28,
+                10,
+                0,
+                4,
+                30,
+                31,
+                32,
+                33,
+                34,
+            ),
+            16315: (
+                9,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27,
+                1,
+                10,
+                0,
+                35,
+                36,
+                37,
+                38,
+                39,
+                30,
+                31,
+                32,
+                33,
+                34,
+            ),
+            18204: (
+                9,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27,
+                1,
+                10,
+                0,
+                35,
+                36,
+                37,
+                38,
+                39,
+                30,
+                31,
+                32,
+                33,
+                34,
+            ),
+            19551: (
+                9,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27,
+                1,
+                10,
+                0,
+                35,
+                36,
+                37,
+                38,
+                39,
+                30,
+                31,
+                32,
+                33,
+                34,
+            ),
+            21485: (
+                9,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27,
+                1,
+                10,
+                0,
+                35,
+                36,
+                37,
+                38,
+                39,
+                30,
+                31,
+                32,
+                33,
+                34,
+            ),
+            25891: (
+                9,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27,
+                10,
+                41,
+                42,
+                43,
+                36,
+                37,
+                38,
+                39,
+                30,
+                31,
+                32,
+                33,
+                34,
+            ),
+            30136: (
+                9,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27,
+                10,
+                41,
+                42,
+                43,
+                36,
+                37,
+                38,
+                39,
+                30,
+                31,
+                32,
+                33,
+                34,
+            ),
+        }
+        # start location in array of values for given object closest to plasma
+        self._start = {
+            0: (21, 0, 3, 3, 1, 4, 2, 3, 3, 9, 0, 1),
+            948: (21, 0, 3, 3, 1, 4, 2, 9, 0, 1),
+            8650: (21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 2, 9, 0, 1),
+            9401: (21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 9, 0, 1),
+            12751: (21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 9, 0, 1),
+            14051: (21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 9, 0, 1),
+            14601: (
+                21,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                2,
+                9,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            16315: (
+                21,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                13,
+                4,
+                2,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            18204: (
+                21,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                13,
+                4,
+                2,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            19551: (
+                21,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                13,
+                4,
+                2,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            21485: (
+                21,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                4,
+                2,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            25891: (
+                21,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                2,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            30136: (
+                21,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                2,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+        }
+        # end location in array of values for given object closest to plasma
+        self._end = {
+            0: (42, 2, 7, 7, 5, 6, 10, 5, 10, 13, 4, 5),
+            948: (42, 2, 7, 7, 5, 6, 34, 13, 4, 5),
+            8650: (42, 4, 26, 25, 32, 2, 9, 8, 3, 35, 22, 28, 3, 5, 34, 13, 4, 5),
+            9401: (42, 4, 26, 22, 32, 5, 9, 8, 5, 35, 22, 26, 5, 27, 13, 4, 5),
+            12751: (39, 2, 4, 26, 25, 32, 2, 9, 8, 3, 35, 22, 28, 5, 25, 13, 4, 5),
+            14051: (39, 2, 5, 5, 20, 26, 8, 11, 7, 5, 3, 4, 14, 4, 5, 25, 13, 4, 10),
+            14601: (
+                39,
+                2,
+                5,
+                5,
+                20,
+                26,
+                8,
+                11,
+                7,
+                5,
+                3,
+                4,
+                14,
+                4,
+                5,
+                25,
+                13,
+                4,
+                2,
+                2,
+                2,
+                2,
+                4,
+            ),
+            16315: (
+                42,
+                5,
+                5,
+                20,
+                26,
+                8,
+                11,
+                7,
+                5,
+                3,
+                4,
+                14,
+                4,
+                16,
+                5,
+                34,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                4,
+            ),
+            18204: (
+                42,
+                5,
+                5,
+                20,
+                26,
+                8,
+                11,
+                7,
+                5,
+                3,
+                4,
+                14,
+                4,
+                16,
+                5,
+                34,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                7,
+            ),
+            19551: (
+                42,
+                5,
+                5,
+                20,
+                26,
+                8,
+                11,
+                7,
+                5,
+                3,
+                4,
+                14,
+                4,
+                16,
+                5,
+                34,
+                2,
+                2,
+                7,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                7,
+            ),
+            21485: (
+                42,
+                6,
+                5,
+                15,
+                6,
+                6,
+                6,
+                7,
+                6,
+                6,
+                3,
+                12,
+                6,
+                3,
+                5,
+                34,
+                2,
+                2,
+                7,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                7,
+            ),
+            25891: (
+                42,
+                6,
+                5,
+                15,
+                6,
+                6,
+                6,
+                7,
+                6,
+                6,
+                3,
+                18,
+                6,
+                3,
+                57,
+                2,
+                2,
+                18,
+                7,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                7,
+            ),
+            30136: (
+                42,
+                6,
+                5,
+                15,
+                6,
+                6,
+                6,
+                7,
+                6,
+                9,
+                2,
+                18,
+                4,
+                2,
+                57,
+                2,
+                2,
+                17,
+                7,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                7,
+            ),
+        }
+        # Which objects are stored reverse of the counter-clockwise motion as described in order
+        self._rev = {
+            0: (0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
+            948: (0, 1, 1, 1, 1, 1, 1, 1, 1, 1),
+            8650: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1),
+            9401: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1),
+            12751: (0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1),
+            14051: (0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1),
+            14601: (
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            16315: (
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            18204: (
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            19551: (
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            21485: (
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            25891: (
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            30136: (
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+        }
+        # ONLY CERTAIN YGC FILES EXIST I MEAN CMON ITS NOT THAT MUCH MEMORY
+        self._ygc_shotfiles = numpy.array(
+            [
+                0,
+                948,
+                8650,
+                9401,
+                12751,
+                14051,
+                14601,
+                16315,
+                18204,
+                19551,
+                21485,
+                25891,
+                30136,
+            ]
+        )
 
-        Returns:
-            currentSign (Integer): 1 for positive-direction current, -1 for negative.
-        """
-        if self._currentSign is None:
-            self._currentSign = -1 if scipy.mean(self.getIpMeas()) > 1e5 else 1
-        return self._currentSign
-
-    def getParam(self, path):
-        """Backup function, applying a direct path input for tree-like data 
-        storage access for parameters not typically found in 
-        :py:class:`Equilbrium <eqtools.core.Equilbrium>` object.  
-        Directly calls attributes read from g/a-files in copy-safe manner.
-
-        Args:
-            name (String): Parameter name for value stored in EqdskReader 
-                instance.
-
-        Raises:
-            NotImplementedError: Not implemented on ASDEX-Upgrade reconstructions.
-        """
-        raise NotImplementedError("self.getEnergy not implemented.")
-
-    def getSSQ(self, inp, **kwargs):
-        """returns single value quantities in the case SV file doesn't exist
-        and coniditions the data in a way that is expected from a dd SV
-        shotfile. This seamlessly hides the lack of an SV file.
-
-        Returns:
-            signal (dd.signal Object): corresponding data
-
-        Raises:
-            ValueError: if module cannot retrieve data from the AUG AFS system.
-        """
-        if self._SSQ is None:
-            try:
-                SSQnameNode = self._MDSTree("SSQnam", calibrated=False)
-                # create a dict mapping the various quantities to positions in the in the data array
-                self._SSQname = SSQnameNode.data
-                try:
-                    self._SSQname = scipy.char.strip(
-                        SSQnameNode.data.view("S" + str(SSQnameNode.data.shape[1]))
-                    )  # concatenate and strip blanks
-                except ValueError:
-                    self._SSQname = scipy.char.strip(
-                        SSQnameNode.data.T.view("S" + str(SSQnameNode.data.shape[0]))
-                    )  # concatenate and strip blanks
-
-                self._SSQname = self._SSQname[
-                    self._SSQname != ""
-                ]  # remove empty entries
-                self._SSQname = dict(
-                    zip(self._SSQname, scipy.arange(self._SSQname.shape[0]))
-                )  # zip the dict together
-
-                self._SSQ = self._MDSTree("SSQ").data
-
-            except (PyddError, AttributeError):
-                raise ValueError("data retrieval failed.")
-
-        if inp == "rays":
-            data = self._SSQ[
-                : self._timeidxend, self._SSQname["rays015"] : self._SSQname["rays000"]
-            ]  # really hackish. This line might break at some point
-            signal = dd.signalGroup(inp, " ", data)
-        else:
-            try:
-                signal = dd.signal(
-                    inp, " ", self._SSQ[: self._timeidxend, self._SSQname[inp]]
-                )
-
-            except KeyError:
-                raise ValueError("data retrieval failed.")
-        return signal
-
-
-class YGCAUGInterface(object):
-
-    # ============================================================================================================
-    #
-    #                     VESSEL OUTLINE HARDCODE VALUES DUE TO ASDEX UPGRADE INCONSISTENCIES
-    #
-    # ============================================================================================================
-
-    # Rather than use another dependency in code, this stores all the necessary interfacing from the data structure
-    # the only necessary implementation is the data handler (dd python package)
-    _vessel_components = {
-        0: (
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-        948: (
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-        8650: (
-            1,
-            1,
-            0,
-            0,
-            1,
-            0,
-            1,
-            0,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-        ),
-        9401: (
-            1,
-            1,
-            0,
-            0,
-            1,
-            0,
-            1,
-            0,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-        ),
-        12751: (
-            1,
-            1,
-            0,
-            0,
-            1,
-            0,
-            1,
-            0,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            1,
-        ),
-        14051: (
-            1,
-            1,
-            0,
-            0,
-            1,
-            0,
-            1,
-            0,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-        ),
-        14601: (
-            1,
-            1,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-        ),
-        16315: (
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-        ),
-        18204: (
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-        ),
-        19551: (
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            1,
-            1,
-            1,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-        ),
-        21485: (
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-        ),
-        25891: (
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-        ),
-        30136: (
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-        ),
-    }
-
-    # counter-clockwise from the inner wall order of components
-    _order = {
-        0: (9, 8, 7, 5, 2, 1, 14, 13, 12, 0, 4, 6),
-        948: (9, 8, 7, 5, 2, 1, 10, 0, 4, 6),
-        8650: (9, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 1, 10, 0, 4, 6),
-        9401: (9, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 10, 0, 4, 6),
-        12751: (9, 29, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 10, 0, 4, 6),
-        14051: (9, 29, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28, 10, 0, 4, 6),
-        14601: (
-            9,
-            29,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            24,
-            25,
-            26,
-            28,
-            10,
-            0,
-            4,
-            30,
-            31,
-            32,
-            33,
-            34,
-        ),
-        16315: (
-            9,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            24,
-            25,
-            26,
-            27,
-            1,
-            10,
-            0,
-            35,
-            36,
-            37,
-            38,
-            39,
-            30,
-            31,
-            32,
-            33,
-            34,
-        ),
-        18204: (
-            9,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            24,
-            25,
-            26,
-            27,
-            1,
-            10,
-            0,
-            35,
-            36,
-            37,
-            38,
-            39,
-            30,
-            31,
-            32,
-            33,
-            34,
-        ),
-        19551: (
-            9,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            24,
-            25,
-            26,
-            27,
-            1,
-            10,
-            0,
-            35,
-            36,
-            37,
-            38,
-            39,
-            30,
-            31,
-            32,
-            33,
-            34,
-        ),
-        21485: (
-            9,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            24,
-            25,
-            26,
-            27,
-            1,
-            10,
-            0,
-            35,
-            36,
-            37,
-            38,
-            39,
-            30,
-            31,
-            32,
-            33,
-            34,
-        ),
-        25891: (
-            9,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            24,
-            25,
-            26,
-            27,
-            10,
-            41,
-            42,
-            43,
-            36,
-            37,
-            38,
-            39,
-            30,
-            31,
-            32,
-            33,
-            34,
-        ),
-        30136: (
-            9,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            24,
-            25,
-            26,
-            27,
-            10,
-            41,
-            42,
-            43,
-            36,
-            37,
-            38,
-            39,
-            30,
-            31,
-            32,
-            33,
-            34,
-        ),
-    }
-
-    # start location in array of values for given object closest to plasma
-    _start = {
-        0: (21, 0, 3, 3, 1, 4, 2, 3, 3, 9, 0, 1),
-        948: (21, 0, 3, 3, 1, 4, 2, 9, 0, 1),
-        8650: (21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 2, 9, 0, 1),
-        9401: (21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 9, 0, 1),
-        12751: (21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 9, 0, 1),
-        14051: (21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 9, 0, 1),
-        14601: (21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 9, 0, 0, 0, 0, 0, 0),
-        16315: (
-            21,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            13,
-            4,
-            2,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-        18204: (
-            21,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            13,
-            4,
-            2,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-        19551: (
-            21,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            13,
-            4,
-            2,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-        21485: (
-            21,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            4,
-            2,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-        25891: (
-            21,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            2,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-        30136: (
-            21,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            2,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-    }
-
-    # end location in array of values for given object closest to plasma
-    _end = {
-        0: (42, 2, 7, 7, 5, 6, 10, 5, 10, 13, 4, 5),
-        948: (42, 2, 7, 7, 5, 6, 34, 13, 4, 5),
-        8650: (42, 4, 26, 25, 32, 2, 9, 8, 3, 35, 22, 28, 3, 5, 34, 13, 4, 5),
-        9401: (42, 4, 26, 22, 32, 5, 9, 8, 5, 35, 22, 26, 5, 27, 13, 4, 5),
-        12751: (39, 2, 4, 26, 25, 32, 2, 9, 8, 3, 35, 22, 28, 5, 25, 13, 4, 5),
-        14051: (39, 2, 5, 5, 20, 26, 8, 11, 7, 5, 3, 4, 14, 4, 5, 25, 13, 4, 10),
-        14601: (
-            39,
-            2,
-            5,
-            5,
-            20,
-            26,
-            8,
-            11,
-            7,
-            5,
-            3,
-            4,
-            14,
-            4,
-            5,
-            25,
-            13,
-            4,
-            2,
-            2,
-            2,
-            2,
-            4,
-        ),
-        16315: (
-            42,
-            5,
-            5,
-            20,
-            26,
-            8,
-            11,
-            7,
-            5,
-            3,
-            4,
-            14,
-            4,
-            16,
-            5,
-            34,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            4,
-        ),
-        18204: (
-            42,
-            5,
-            5,
-            20,
-            26,
-            8,
-            11,
-            7,
-            5,
-            3,
-            4,
-            14,
-            4,
-            16,
-            5,
-            34,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            7,
-        ),
-        19551: (
-            42,
-            5,
-            5,
-            20,
-            26,
-            8,
-            11,
-            7,
-            5,
-            3,
-            4,
-            14,
-            4,
-            16,
-            5,
-            34,
-            2,
-            2,
-            7,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            7,
-        ),
-        21485: (
-            42,
-            6,
-            5,
-            15,
-            6,
-            6,
-            6,
-            7,
-            6,
-            6,
-            3,
-            12,
-            6,
-            3,
-            5,
-            34,
-            2,
-            2,
-            7,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            7,
-        ),
-        25891: (
-            42,
-            6,
-            5,
-            15,
-            6,
-            6,
-            6,
-            7,
-            6,
-            6,
-            3,
-            18,
-            6,
-            3,
-            57,
-            2,
-            2,
-            18,
-            7,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            7,
-        ),
-        30136: (
-            42,
-            6,
-            5,
-            15,
-            6,
-            6,
-            6,
-            7,
-            6,
-            9,
-            2,
-            18,
-            4,
-            2,
-            57,
-            2,
-            2,
-            17,
-            7,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            7,
-        ),
-    }
-
-    # Which objects are stored reverse of the counter-clockwise motion as described in order
-    _rev = {
-        0: (0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
-        948: (0, 1, 1, 1, 1, 1, 1, 1, 1, 1),
-        8650: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1),
-        9401: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1),
-        12751: (0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1),
-        14051: (0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1),
-        14601: (0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0),
-        16315: (
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-        18204: (
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-        19551: (
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-        21485: (
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-        25891: (
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-        30136: (
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-    }
-
-    # ONLY CERTAIN YGC FILES EXIST I MEAN CMON ITS NOT THAT MUCH MEMORY
-    _ygc_shotfiles = numpy.array(
-        [
-            0,
-            948,
-            8650,
-            9401,
-            12751,
-            14051,
-            14601,
-            16315,
-            18204,
-            19551,
-            21485,
-            25891,
-            30136,
-        ]
-    )
-
-    def _getData(self, shot):
+    def _getDataVessel(self, shot):
         try:
-
             self._ygc_shot = self._ygc_shotfiles[
-                scipy.searchsorted(self._ygc_shotfiles, [shot], "right") - 1
+                numpy.searchsorted(self._ygc_shotfiles, [shot], "right") - 1
             ][
                 0
             ]  # find nearest shotfile which is the before it
 
             if self._ygc_shot < 8650:
-                ccT = dd.shotfile(
-                    "YGC", self._ygc_shotfiles[2]
-                )  # This is because of shots <8650 not having RrGC zzGC or inxbeg
+                ccT = sf.SFREAD(self._ygc_shotfiles[2], "YGC")  # This is because of shots <8650 not having RrGC zzGC or inxbeg
             else:
-                ccT = dd.shotfile("YGC", self._ygc_shot)
-            xvctr = ccT("RrGC")
-            yvctr = ccT("zzGC")
-            nvctr = ccT("inxbeg")
-            nvctr = nvctr.data.astype(int) - 1
-
-        except (PyddError, AttributeError):
+                ccT = sf.SFREAD(self._ygc_shot, "YGC")
+            xvctr = ccT.getobject("RrGC")
+            yvctr = ccT.getobject("zzGC")
+            nvctr = ccT.getobject("inxbeg")
+            nvctr = nvctr.astype(int) - 1
+        except (AttributeError):
             raise ValueError("data retrieval failed.")
-
         except:
             raise ValueError("data load failed.")
+        return xvctr, yvctr, nvctr
 
-        return xvctr.data, yvctr.data, nvctr
-
-    def getMachineCrossSection(self, shot):
+    def _VesselgetMachineCrossSection(self):
         """Returns R,Z coordinates of vacuum-vessel wall for masking, plotting 
         routines.
         
@@ -2850,7 +3074,7 @@ class YGCAUGInterface(object):
             * **R_limiter** (`Array`) - [n] array of x-values for machine cross-section.
             * **Z_limiter** (`Array`) - [n] array of y-values for machine cross-section.
         """
-        xvctr, yvctr, nvctr = self._getData(shot)
+        xvctr, yvctr, nvctr = self._getDataVessel(self._shot)
         x = []
         y = []
 
@@ -2860,7 +3084,7 @@ class YGCAUGInterface(object):
         rev = self._rev[self._ygc_shot]
         order = self._order[self._ygc_shot]
 
-        for i in xrange(len(order)):
+        for i in range(len(order)):
             idx = nvctr[order[i]]
             xseg = xvctr[idx + start[i] : idx + end[i]]
             yseg = yvctr[idx + start[i] : idx + end[i]]
@@ -2877,7 +3101,7 @@ class YGCAUGInterface(object):
 
         return (x[::-1], y[::-1])
 
-    def getMachineCrossSectionFull(self, shot):
+    def _VesselgetMachineCrossSectionFull(self):
         """Returns R,Z coordinates of vacuum-vessel wall for plotting routines.
         
         Absent additional vector-graphic data on machine cross-section, returns
@@ -2887,7 +3111,7 @@ class YGCAUGInterface(object):
             result from getMachineCrossSection().
         """
 
-        xvctr, yvctr, nvctr = self._getData(shot)
+        xvctr, yvctr, nvctr = self._getDataVessel(self._shot)
 
         # get valid components which is in the data structure for some shots, but not all and had to be hardcoded
         temp = self._vessel_components[self._ygc_shot]
@@ -2895,7 +3119,7 @@ class YGCAUGInterface(object):
         x = []
         y = []
 
-        for i in xrange(len(nvctr) - 1):
+        for i in range(len(nvctr) - 1):
             if temp[i]:
                 xseg = xvctr[nvctr[i] : nvctr[i + 1]]
                 yseg = yvctr[nvctr[i] : nvctr[i + 1]]
@@ -2907,15 +3131,3 @@ class YGCAUGInterface(object):
         x = numpy.array(x[:-1])
         y = numpy.array(y[:-1])
         return (x, y)
-
-
-if _has_dd:
-    AUGVessel = YGCAUGInterface()  # import setting necessary to get the vacuum vessel
-
-
-class AUGDDDataProp(AUGDDData, PropertyAccessMixin):
-    """AUGDDData with the PropertyAccessMixin added to enable property-style
-    access. This is good for interactive use, but may drag the performance down.
-    """
-
-    pass
