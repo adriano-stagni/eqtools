@@ -1269,7 +1269,7 @@ class AUGSFData(Equilibrium):
         if self._betat is None:
             try:
                 _WMHD, _Vol = self.getWMHD(), self.getVolLCFS()
-                _pAvg = _WMHD/_Vol
+                _pAvg = 2/3 * _WMHD/_Vol
                 _bt0 = self.getBtPla()
                 self._betat = 2*mu_0 * _pAvg / _bt0**2
             except:
