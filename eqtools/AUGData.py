@@ -1175,7 +1175,7 @@ class AUGSFData(Equilibrium):
         if self._btaxv is None:
             try:
                 _btaxv = sf.SFREAD(self._shot, "MBI")
-                self._btaxv = interp1d(_btaxv.gettimebase("BTF"), _btaxv.getobject("BTF").data())(self._time)
+                self._btaxv = interp1d(_btaxv.gettimebase("BTF"), _btaxv.getobject("BTF"))(self._time)
                 self._defaultUnits["_btaxv"] = 'T'
             except AttributeError:
                 raise ValueError("data retrieval failed.")
